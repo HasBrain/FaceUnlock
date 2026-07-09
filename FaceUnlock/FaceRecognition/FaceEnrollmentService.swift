@@ -110,7 +110,11 @@ struct VerificationResult {
 
 struct EnrollmentReport {
     let savedURL: URL
+    /// Total embeddings on disk after the save (includes previously-enrolled ones
+    /// when the save was additive).
     let savedEmbeddings: Int
+    /// Number of embeddings appended by THIS session (vs already present on disk).
+    let embeddingsAdded: Int
 }
 
 final class FaceEnrollmentService {
@@ -124,6 +128,12 @@ final class FaceEnrollmentService {
     // laptop camera (78° FOV, ~15 cm face) — well past the 70 cm working target.
     nonisolated static let minimumFaceWidthFraction: CGFloat = 0.10
     nonisolated static let minimumCaptureQuality: Float = 0.35
+
+    /// Hard cap on total embeddings kept on disk. Additive enrollment beyond this
+    /// evicts the OLDEST embeddings (FIFO) — 7 poses × 5 sessions is enough to
+    /// cover a range of lighting conditions without letting the enrolled set
+    /// grow unbounded.
+    nonisolated static let maxEnrolledEmbeddings: Int = 35
 
     /// Centered region of interest (in Vision's normalized frame coordinates) that
     /// approximates the visible viewfinder circle. Faces whose bounding-box center
@@ -243,6 +253,43 @@ final class FaceEnrollmentService {
         }
     }
 
+    /// Additive save: reads any existing enrolled embeddings, concatenates the
+    /// new set, and writes the combined result back. If the combined total
+    /// would exceed `maxEnrolledEmbeddings`, the oldest embeddings are evicted
+    /// first (FIFO) — newer captures reflect the user's current appearance
+    /// (lighting, hair, beard, etc.) more faithfully than old ones.
+    ///
+    /// Use this when the user is adding a supplementary enrollment session.
+    /// For a full re-enrollment (Reset → Capture), call `saveEmbeddings`
+    /// directly with only the new embeddings.
+    ///
+    /// Throws whatever `loadEmbeddings` / `saveEmbeddings` throw (session
+    /// locked, storage failure, etc.). If the enrolled file doesn't exist,
+    /// this behaves the same as `saveEmbeddings` (existing = []).
+    func appendEmbeddings(_ new: [[Float]]) throws -> URL {
+        // Load existing. Throw on read errors (session locked etc.) so we
+        // don't silently blow away the encrypted file.
+        let existing: [[Float]] = try Self.loadEmbeddings() ?? []
+
+        var combined = existing + new
+        if combined.count > Self.maxEnrolledEmbeddings {
+            let excess = combined.count - Self.maxEnrolledEmbeddings
+            combined.removeFirst(excess)
+        }
+        return try saveEmbeddings(combined)
+    }
+
+    /// Total embeddings currently enrolled on disk. Zero if the file doesn't
+    /// exist or can't be read (session locked, corruption, etc.). Doesn't
+    /// prompt for auth — safe to call from UI display code.
+    static func enrolledCount() -> Int {
+        // `try?` flattens the nested Optional here — either we get the array or nil.
+        if let loaded = try? loadEmbeddings() {
+            return loaded.count
+        }
+        return 0
+    }
+
     // MARK: - Verify (centroid + max-individual)
 
     func verify(
@@ -295,21 +342,161 @@ final class FaceEnrollmentService {
 
     // MARK: - Alignment + fallback crop
 
-    /// Preferred crop path. Tries landmark-based affine alignment (rotates + scales +
-    /// translates the source image so the eyes land at InsightFace's canonical
-    /// positions in a 112×112 output). Falls back to the axis-aligned 40%-padded
-    /// bbox crop if landmarks aren't available or are degenerate.
+    /// Preferred crop path. Three-tier alignment strategy:
+    ///
+    ///   1. **5-point Umeyama alignment** (preferred): maps detected eye
+    ///      centers, nose tip, and mouth corners onto InsightFace's canonical
+    ///      5-point template via a least-squares similarity transform. This
+    ///      matches the exact preprocessing InsightFace uses at training
+    ///      time, so the resulting crops lie closer to the model's training
+    ///      distribution than a 2-point alignment.
+    ///
+    ///   2. **2-point eye alignment** (fallback): if the nose or outer-lip
+    ///      landmark regions are missing / empty, we still have both eyes,
+    ///      so we solve the exact 2-point similarity transform. This is what
+    ///      we used exclusively before.
+    ///
+    ///   3. **Padded bbox crop** (last resort): no usable landmarks at all,
+    ///      so we crop the axis-aligned bounding box with 20% padding.
     private func alignedOrPaddedCrop(pixelBuffer: CVPixelBuffer, face: VNFaceObservation) throws -> CGImage {
-        if let landmarks = face.landmarks,
-           let leftEye = landmarks.leftEye,
-           let rightEye = landmarks.rightEye,
-           leftEye.pointCount > 0,
-           rightEye.pointCount > 0,
-           let aligned = alignFace(in: pixelBuffer, leftEye: leftEye, rightEye: rightEye)
-        {
-            return aligned
+        if let landmarks = face.landmarks {
+            // Tier 1 — 5-point.
+            if let aligned = align5PointFace(in: pixelBuffer, landmarks: landmarks) {
+                return aligned
+            }
+            // Tier 2 — 2-point eye.
+            if let leftEye = landmarks.leftEye,
+               let rightEye = landmarks.rightEye,
+               leftEye.pointCount > 0,
+               rightEye.pointCount > 0,
+               let aligned = alignFace(in: pixelBuffer, leftEye: leftEye, rightEye: rightEye)
+            {
+                return aligned
+            }
         }
+        // Tier 3 — bbox crop.
         return try cropFace(in: pixelBuffer, boundingBox: face.boundingBox)
+    }
+
+    /// 5-point landmark alignment via a least-squares 2D similarity transform.
+    /// Matches the preprocessing InsightFace uses at training time (documented
+    /// in their official evaluation guide) — the same crop the model saw
+    /// during training gives it embeddings closer to its trained distribution.
+    ///
+    /// **Why 5 points beats 2 points**:
+    ///
+    /// - The two eyes lie on the same horizontal line, so a 2-point transform
+    ///   has no constraint on vertical positioning of nose/mouth — a slightly
+    ///   longer face than average ends up with the mouth outside the
+    ///   canonical position.
+    /// - Small eye-detection noise gets amplified in a 2-point fit
+    ///   (exact solution). A 5-point least-squares fit spreads and absorbs
+    ///   the noise.
+    /// - Adds implicit pitch compensation via the nose height constraint.
+    ///
+    /// Returns nil if any required landmark region is missing/degenerate or
+    /// if the resulting transform has a nonsense scale (safety guard) — the
+    /// caller then falls back to 2-point alignment.
+    private func align5PointFace(in pixelBuffer: CVPixelBuffer,
+                                  landmarks: VNFaceLandmarks2D) -> CGImage? {
+        guard
+            let leftEye = landmarks.leftEye, leftEye.pointCount > 0,
+            let rightEye = landmarks.rightEye, rightEye.pointCount > 0,
+            let nose = landmarks.nose, nose.pointCount > 0,
+            let outerLips = landmarks.outerLips, outerLips.pointCount >= 2
+        else { return nil }
+
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let imageSize = ciImage.extent.size
+
+        let leftEyePts = leftEye.pointsInImage(imageSize: imageSize)
+        let rightEyePts = rightEye.pointsInImage(imageSize: imageSize)
+        let nosePts = nose.pointsInImage(imageSize: imageSize)
+        let lipPts = outerLips.pointsInImage(imageSize: imageSize)
+
+        // Nose tip ≈ lowest-y point in the nose region. Vision uses a bottom-
+        // left origin (y ↑), so "lowest y" is the point closest to the mouth,
+        // which for a normally-oriented face is the nose tip.
+        guard let noseTip = nosePts.min(by: { $0.y < $1.y }) else { return nil }
+
+        // Mouth corners = leftmost and rightmost points of the outer-lip
+        // contour along the x-axis.
+        guard let leftMouth = lipPts.min(by: { $0.x < $1.x }),
+              let rightMouth = lipPts.max(by: { $0.x < $1.x })
+        else { return nil }
+
+        // Source: 5 detected landmark centers in the input frame.
+        let source: [CGPoint] = [
+            Self.averagePoint(leftEyePts),
+            Self.averagePoint(rightEyePts),
+            noseTip,
+            leftMouth,
+            rightMouth,
+        ]
+
+        // Destination: InsightFace canonical 5-point template for a 112×112
+        // output. The published template is defined in top-left origin (the
+        // training convention); we flip y for Core Image's bottom-left origin.
+        let outputSize: CGFloat = 112
+        let dest: [CGPoint] = [
+            CGPoint(x: 38.2946, y: outputSize - 51.6963),  // left eye
+            CGPoint(x: 73.5318, y: outputSize - 51.5014),  // right eye
+            CGPoint(x: 56.0252, y: outputSize - 71.7366),  // nose tip
+            CGPoint(x: 41.5493, y: outputSize - 92.3655),  // left mouth
+            CGPoint(x: 70.7299, y: outputSize - 92.2041),  // right mouth
+        ]
+
+        // Least-squares 2D similarity transform (source → dest). Closed-form
+        // 2D specialization of Umeyama's algorithm:
+        //   1. Subtract centroids to remove translation from the objective.
+        //   2. a = Σ (dp · dq) / Σ ‖dp‖²   ← rotation-scale x component
+        //      b = Σ (dp × dq) / Σ ‖dp‖²   ← rotation-scale y component
+        //   3. Rotation-scale matrix is [[a, -b], [b, a]]; translation is
+        //      recovered from t = μ_q − R·μ_p.
+        // For n=2 this reduces exactly to the existing eye-only formula
+        // (verified analytically) — so numerically the 2-point and 5-point
+        // paths agree in the degenerate case.
+        let n = source.count
+        var muP = CGPoint.zero, muQ = CGPoint.zero
+        for i in 0..<n {
+            muP.x += source[i].x; muP.y += source[i].y
+            muQ.x += dest[i].x;   muQ.y += dest[i].y
+        }
+        muP.x /= CGFloat(n); muP.y /= CGFloat(n)
+        muQ.x /= CGFloat(n); muQ.y /= CGFloat(n)
+
+        var sPP: CGFloat = 0
+        var sXX: CGFloat = 0
+        var sXY: CGFloat = 0
+        for i in 0..<n {
+            let dpx = source[i].x - muP.x
+            let dpy = source[i].y - muP.y
+            let dqx = dest[i].x - muQ.x
+            let dqy = dest[i].y - muQ.y
+            sPP += dpx * dpx + dpy * dpy
+            sXX += dpx * dqx + dpy * dqy
+            sXY += dpx * dqy - dpy * dqx
+        }
+        guard sPP > 1e-6 else { return nil }
+
+        let a = sXX / sPP
+        let b = sXY / sPP
+
+        // Sanity check: the composite scale is sqrt(a² + b²). Reject if it's
+        // nonsense (e.g. degenerate landmark clustering could yield extreme
+        // scales) — the 2-point fallback path will produce a valid crop.
+        let scale = (a * a + b * b).squareRoot()
+        guard scale > 0.05, scale < 20 else { return nil }
+
+        let tx = muQ.x - (a * muP.x - b * muP.y)
+        let ty = muQ.y - (b * muP.x + a * muP.y)
+
+        // CGAffineTransform lays the matrix out as x' = a*x + c*y + tx,
+        // y' = b*x + d*y + ty. Our similarity has c = -b, d = a.
+        let transform = CGAffineTransform(a: a, b: b, c: -b, d: a, tx: tx, ty: ty)
+        let transformed = ciImage.transformed(by: transform)
+        let outputRect = CGRect(x: 0, y: 0, width: outputSize, height: outputSize)
+        return ciContext.createCGImage(transformed, from: outputRect)
     }
 
     /// Compute a similarity transform (rotate + uniform scale + translate) that maps

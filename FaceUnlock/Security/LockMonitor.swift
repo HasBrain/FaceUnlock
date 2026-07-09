@@ -5,6 +5,7 @@
 
 import Foundation
 import AppKit
+import CoreGraphics
 import Observation
 
 @Observable
@@ -136,5 +137,31 @@ final class LockMonitor {
         if recentEvents.count > Self.maxEvents {
             recentEvents.removeFirst(recentEvents.count - Self.maxEvents)
         }
+    }
+
+    /// Authoritative screen-lock state, queried directly from the CoreGraphics
+    /// session server rather than derived from a distributed notification.
+    ///
+    /// `com.apple.screenIsLocked` and `com.apple.screenIsUnlocked` are
+    /// distributed notifications — any user-session process can post them, and
+    /// there is no sender-authenticity check. Relying on them alone means a
+    /// malicious app running as the same user could spoof "screen is locked"
+    /// while it actually isn't, then wait for our unlock flow to type the
+    /// password into whatever window is frontmost.
+    ///
+    /// `CGSessionCopyCurrentDictionary()` queries the graphics session server
+    /// directly, so its `CGSSessionScreenIsLocked` value can't be spoofed by
+    /// unprivileged user-session code. Use this as the source of truth for
+    /// security-sensitive gates (like the pre-injection check in the unlock
+    /// flow); the notification path is still fine for cheap event triggering.
+    ///
+    /// Returns `false` when the session dictionary is unavailable — a safe
+    /// default for our callers, since they refuse to inject when the check
+    /// fails.
+    nonisolated static func isScreenActuallyLocked() -> Bool {
+        guard let dict = CGSessionCopyCurrentDictionary() as? [String: Any] else {
+            return false
+        }
+        return (dict["CGSSessionScreenIsLocked"] as? Bool) ?? false
     }
 }

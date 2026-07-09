@@ -92,6 +92,12 @@ final class CameraManager {
             if self.session.isRunning {
                 self.session.stopRunning()
             }
+            // Drop the last captured frame so a subsequent restart can't
+            // return a stale buffer from the previous session while waiting
+            // for fresh frames to arrive.
+            self.bufferLock.lock()
+            self._latestPixelBuffer = nil
+            self.bufferLock.unlock()
             DispatchQueue.main.async {
                 self.isRunning = false
             }

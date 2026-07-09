@@ -23,6 +23,13 @@ struct ContentView: View {
     @State private var totalCaptured: Int = 0
     @State private var enrollmentTask: Task<Void, Never>? = nil
 
+    /// Cached enrolled-embedding count for the idle-status text. Avoids the
+    /// disk-read + AES-GCM decrypt that `FaceEnrollmentService.enrolledCount()`
+    /// performs on every call — SwiftUI can re-render the status label many
+    /// times per second during framing-watcher updates. Refreshed on view
+    /// appear, after successful enrollment, and after reset.
+    @State private var enrolledCountCached: Int = FaceEnrollmentService.enrolledCount()
+
     // Password / accessibility view-local UI state
     @State private var showingPasswordSetup = false
     @State private var passwordMessage: String? = nil
@@ -30,11 +37,25 @@ struct ContentView: View {
     @State private var injectionCountdown: Int = 0
 
     // Constants for enrollment
-    private let framesPerPose = 1                // one frame per pose — 7 diverse poses cover the variance previously earned by 2× redundancy
     private let posesInEnrollment = 7
-    private var targetTotalEmbeddings: Int { framesPerPose * posesInEnrollment }
+    /// One stable embedding is captured per pose — the "target" total for the
+    /// progress display equals the number of poses.
+    private var targetTotalEmbeddings: Int { posesInEnrollment }
     private let perPoseTimeoutSeconds: Double = 60
     private let enrollmentPollIntervalNS: UInt64 = 150_000_000
+
+    // Stable-capture tuning.
+    /// Once the user hits the target pose, we collect frames over this window
+    /// and average them into a single stable embedding. Averaging beats a
+    /// single-shot capture — motion blur, exposure jitter, and alignment
+    /// micro-errors are smoothed out (√N noise reduction), so each stored
+    /// embedding is closer to the true face manifold and downstream
+    /// verification similarity is more stable.
+    private let stableCaptureWindowSeconds: TimeInterval = 2.0
+    /// Minimum kept-frame count required from the 2-second window. Frames
+    /// where the pose stops matching or quality dips are excluded — if
+    /// fewer than this many survive, the pose has to be re-attempted.
+    private let stableCaptureMinSamples = 4
 
     var body: some View {
         TabView {
@@ -67,6 +88,9 @@ struct ContentView: View {
                 break
             }
             controller.refreshSetupState()
+            // Refresh in case the enrolled file changed while the window was closed
+            // (e.g. session unlocked after launch → decryptable now).
+            enrolledCountCached = FaceEnrollmentService.enrolledCount()
         }
         .onDisappear {
             enrollmentTask?.cancel()
@@ -473,7 +497,15 @@ struct ContentView: View {
                     if controller.isWorking {
                         ProgressView().controlSize(.small)
                     } else {
-                        Label("Capture", systemImage: "camera.fill")
+                        // "Add Captures" once an enrollment exists — additive
+                        // sessions (e.g. re-enrolling under different lighting)
+                        // keep the previous data and enlarge the enrolled set.
+                        Label(
+                            FaceEnrollmentService.hasEnrolledFace()
+                                ? "Add Captures"
+                                : "Capture",
+                            systemImage: "camera.fill"
+                        )
                     }
                 }
                 .keyboardShortcut(.defaultAction)
@@ -508,17 +540,19 @@ struct ContentView: View {
     private var statusLabel: some View {
         switch controller.status {
         case .idle:
-            Text(FaceEnrollmentService.hasEnrolledFace()
-                 ? "A face is enrolled. Press Verify to scan or Run Unlock to test the full flow."
-                 : "Press Capture to enroll. You'll be guided through 4 poses (straight, left, right, tilt).")
+            Text(enrolledCountCached > 0
+                 ? "\(enrolledCountCached) of \(FaceEnrollmentService.maxEnrolledEmbeddings) embeddings enrolled. Verify to scan, or Add Captures under new lighting for better robustness."
+                 : "Press Capture to enroll. You'll be guided through 7 poses (~2s each): straight, turn L/R, roll L/R, closer, farther.")
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
         case .enrolled(let report):
             VStack(spacing: 2) {
-                Label("Enrolled \(report.savedEmbeddings) embeddings across 4 poses",
-                      systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
+                Label(
+                    "Enrolled: \(report.savedEmbeddings) total embeddings (\(report.embeddingsAdded) added this session)",
+                    systemImage: "checkmark.circle.fill"
+                )
+                .foregroundStyle(.green)
                 Text(report.savedURL.path)
                     .font(.caption2).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
@@ -603,20 +637,31 @@ struct ContentView: View {
             for (index, pose) in poses.enumerated() {
                 currentPoseIndex = index
                 currentEnrollmentPose = pose
-                poseProgress = (0, framesPerPose)
+                poseProgress = (0, stableCaptureMinSamples)
                 controller.liveAnalysis = nil
                 controller.liveError = nil
 
-                let embeddings = try await collectFrames(for: pose,
-                                                         count: framesPerPose,
-                                                         timeoutSeconds: perPoseTimeoutSeconds)
-                collected.append(contentsOf: embeddings)
+                let stable = try await collectStableEmbedding(
+                    for: pose,
+                    timeoutSeconds: perPoseTimeoutSeconds
+                )
+                collected.append(stable)
+                totalCaptured = collected.count
             }
-            let url = try controller.service.saveEmbeddings(collected)
-            // If saveEmbeddings just created a fresh session key (first-time use),
+            // Additive save: appends to any existing enrolled set (with FIFO cap).
+            // Behaves identically to a fresh save when nothing was enrolled before,
+            // because existing = [] in that case.
+            let url = try controller.service.appendEmbeddings(collected)
+            // If appendEmbeddings just created a fresh session key (first-time use),
             // reflect the unlocked state in the UI.
             controller.refreshSetupState()
-            controller.status = .enrolled(EnrollmentReport(savedURL: url, savedEmbeddings: collected.count))
+            let totalAfterSave = FaceEnrollmentService.enrolledCount()
+            enrolledCountCached = totalAfterSave
+            controller.status = .enrolled(EnrollmentReport(
+                savedURL: url,
+                savedEmbeddings: totalAfterSave,
+                embeddingsAdded: collected.count
+            ))
         } catch is CancellationError {
             controller.status = .cancelled
         } catch {
@@ -657,46 +702,122 @@ struct ContentView: View {
         }
     }
 
-    private func collectFrames(for pose: FacePose, count: Int, timeoutSeconds: Double) async throws -> [[Float]] {
-        var collected: [[Float]] = []
+    /// Wait for the target pose, then capture frames over a 2-second stability
+    /// window and average their embeddings into a single stable embedding.
+    ///
+    /// Two phases:
+    ///
+    ///   1. **Enter-pose**: poll the camera until the user's yaw/roll/faceWidth
+    ///      match the pose bounds AND quality clears the minimum. Times out at
+    ///      `timeoutSeconds` if the user never gets into the pose.
+    ///
+    ///   2. **Stability window**: for the next `stableCaptureWindowSeconds`,
+    ///      continue polling and collect embeddings ONLY from frames where the
+    ///      pose is still held and quality is still high. Requires at least
+    ///      `stableCaptureMinSamples` survivors — otherwise the pose is
+    ///      considered failed and the outer enroll() propagates the timeout.
+    ///
+    /// The survivors are averaged element-wise and L2-normalized. This gives
+    /// √N noise cancellation vs a single-shot capture at the cost of 2s per
+    /// pose — a good trade because each stored embedding then represents a
+    /// tighter, more repeatable point on the face manifold.
+    private func collectStableEmbedding(
+        for pose: FacePose,
+        timeoutSeconds: Double
+    ) async throws -> [Float] {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
 
-        while collected.count < count, Date() < deadline {
+        // Phase 1: wait for the pose to be entered.
+        var poseEntered = false
+        while Date() < deadline {
             if Task.isCancelled { throw CancellationError() }
             try? await Task.sleep(nanoseconds: enrollmentPollIntervalNS)
             guard let frame = controller.camera.currentFrame() else { continue }
 
+            let analysis: FrameAnalysis
             do {
-                let analysis = try controller.service.analyzeFrame(frame, includeQuality: true)
-                controller.liveAnalysis = LiveAnalysis(
-                    yaw: analysis.yaw,
-                    roll: analysis.roll,
-                    quality: analysis.quality,
-                    faceWidth: analysis.face.boundingBox.width
-                )
-                controller.liveError = nil
-
-                guard analysis.quality >= FaceEnrollmentService.minimumCaptureQuality else { continue }
-                guard pose.matches(
-                    yaw: analysis.yaw,
-                    roll: analysis.roll,
-                    faceWidth: analysis.face.boundingBox.width
-                ) else { continue }
-
-                collected.append(analysis.embedding)
-                poseProgress = (collected.count, count)
-                totalCaptured += 1
+                analysis = try controller.service.analyzeFrame(frame, includeQuality: true)
             } catch {
                 controller.liveAnalysis = nil
-                controller.liveError = (error as? FaceEnrollmentError)?.errorDescription ?? error.localizedDescription
+                controller.liveError = (error as? FaceEnrollmentError)?.errorDescription
+                                     ?? error.localizedDescription
                 continue
             }
+            controller.liveAnalysis = LiveAnalysis(
+                yaw: analysis.yaw,
+                roll: analysis.roll,
+                quality: analysis.quality,
+                faceWidth: analysis.face.boundingBox.width
+            )
+            controller.liveError = nil
+
+            guard analysis.quality >= FaceEnrollmentService.minimumCaptureQuality else { continue }
+            guard pose.matches(
+                yaw: analysis.yaw,
+                roll: analysis.roll,
+                faceWidth: analysis.face.boundingBox.width
+            ) else { continue }
+
+            poseEntered = true
+            break
+        }
+        guard poseEntered else { throw FaceEnrollmentError.poseTimeout(pose) }
+
+        // Phase 2: 2-second stability window. Keep only frames where the pose
+        // is still held AND quality is still high.
+        var kept: [[Float]] = []
+        let captureDeadline = Date().addingTimeInterval(stableCaptureWindowSeconds)
+        while Date() < captureDeadline {
+            if Task.isCancelled { throw CancellationError() }
+            try? await Task.sleep(nanoseconds: enrollmentPollIntervalNS)
+            guard let frame = controller.camera.currentFrame() else { continue }
+
+            let analysis: FrameAnalysis
+            do {
+                analysis = try controller.service.analyzeFrame(frame, includeQuality: true)
+            } catch { continue }
+
+            controller.liveAnalysis = LiveAnalysis(
+                yaw: analysis.yaw,
+                roll: analysis.roll,
+                quality: analysis.quality,
+                faceWidth: analysis.face.boundingBox.width
+            )
+
+            guard analysis.quality >= FaceEnrollmentService.minimumCaptureQuality,
+                  pose.matches(
+                      yaw: analysis.yaw,
+                      roll: analysis.roll,
+                      faceWidth: analysis.face.boundingBox.width
+                  )
+            else { continue }
+
+            kept.append(analysis.embedding)
+            // Progress ticks up until we hit min samples; further frames still
+            // count toward the average but the UI stops incrementing at target.
+            poseProgress = (min(kept.count, stableCaptureMinSamples),
+                            stableCaptureMinSamples)
         }
 
-        guard collected.count >= count else {
+        guard kept.count >= stableCaptureMinSamples else {
             throw FaceEnrollmentError.poseTimeout(pose)
         }
-        return collected
+        return Self.averageAndL2Normalize(kept)
+    }
+
+    /// Element-wise mean of embedding vectors, then L2-normalized to unit length
+    /// — the standard technique for aggregating multiple face embeddings into
+    /// a single "prototype" for the pose.
+    private static func averageAndL2Normalize(_ vecs: [[Float]]) -> [Float] {
+        guard let first = vecs.first else { return [] }
+        let dim = first.count
+        var sum = [Float](repeating: 0, count: dim)
+        for vec in vecs {
+            for i in 0..<dim { sum[i] += vec[i] }
+        }
+        let n = Float(vecs.count)
+        for i in 0..<dim { sum[i] /= n }
+        return FaceEmbedder.l2Normalize(sum)
     }
 
     // MARK: - Settings tab — Session-lock content
@@ -995,6 +1116,7 @@ struct ContentView: View {
                 let names = removed.map { $0.lastPathComponent }.joined(separator: ", ")
                 controller.status = .info("Reset complete. Removed: \(names)")
             }
+            enrolledCountCached = FaceEnrollmentService.enrolledCount()
         } catch {
             controller.status = .failure(error.localizedDescription)
         }

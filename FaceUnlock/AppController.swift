@@ -166,6 +166,22 @@ final class AppController {
     let pollIntervalNS: UInt64 = 60_000_000  // 60 ms (~17 fps scan)
     let verifyScanTimeoutSeconds: Double = 15
 
+    /// Frames captured during the first N ms after camera start are excluded
+    /// from the best-of-N embedding average. Cold-camera AE/AWB is still
+    /// converging in this window, so the embeddings from those frames don't
+    /// match the enrollment distribution and would drag similarity down.
+    private let scanWarmupDiscardMS: Double = 800
+
+    /// Frames outside this pose envelope are excluded from the best-of-N
+    /// embedding average. Off-angle frames (large yaw or roll) produce
+    /// embeddings that don't correspond to the head-on views that dominate
+    /// real usage — including them shifts the running average toward extreme
+    /// enrollment poses and lowers centroid similarity for typical live views.
+    /// 0.35 rad ≈ 20°, well beyond normal look-at-screen head motion but tight
+    /// enough to filter out clearly-turned frames.
+    private let poseAcceptableYawMax: Float = 0.35
+    private let poseAcceptableRollMax: Float = 0.35
+
     init() {
         // Restore icon-placement preferences (default: hidden from dock, shown in menu bar).
         self.showInDock = UserDefaults.standard.bool(forKey: Self.dockPrefKey)
@@ -198,6 +214,11 @@ final class AppController {
         }
         lockMonitor.onScreensUnlocked = { [weak self] in
             Task { @MainActor [weak self] in
+                // If the user manually unlocked while we had a scan / unlock
+                // task in flight, cancel it. Otherwise the scan could finish
+                // and inject the password into whatever window is frontmost
+                // in the now-unlocked session.
+                self?.currentTask?.cancel()
                 self?.stopInputMonitor()
             }
         }
@@ -408,6 +429,33 @@ final class AppController {
         return true
     }
 
+    // MARK: - Camera settling
+
+    /// Wait for the camera to produce stable frames after a fresh start.
+    ///
+    /// A fixed sleep (previously 800ms) is insufficient for a cold camera
+    /// that macOS has powered down during hours of display sleep: auto-exposure
+    /// and auto-white-balance are still converging past 800ms, so the first
+    /// frames captured are systematically darker/brighter than enrollment
+    /// frames. That drops embedding cosine similarity by 0.1–0.2 for the
+    /// same face — enough to fail verification at threshold 0.85.
+    ///
+    /// This routine waits for:
+    ///   1. The first frame to arrive (bounded at 2s).
+    ///   2. An additional ~1s for AE/AWB convergence.
+    ///
+    /// Warm cameras (e.g. framing watcher already running) skip this via the
+    /// `weStartedCamera` guard at the call site.
+    private func waitForCameraSettled() async {
+        let firstFrameDeadline = Date().addingTimeInterval(2.0)
+        while camera.currentFrame() == nil {
+            if Date() > firstFrameDeadline { return }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        // AE/AWB convergence budget on top of first-frame arrival.
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+    }
+
     // MARK: - Wake handling
 
     private func handleScreensWoke() {
@@ -495,7 +543,7 @@ final class AppController {
         let weStartedCamera = !camera.isRunning
         if weStartedCamera {
             await camera.start()
-            try? await Task.sleep(nanoseconds: 800_000_000)
+            await waitForCameraSettled()
         }
 
         defer {
@@ -545,7 +593,7 @@ final class AppController {
         let weStartedCamera = !camera.isRunning
         if weStartedCamera {
             await camera.start()
-            try? await Task.sleep(nanoseconds: 800_000_000)
+            await waitForCameraSettled()
         }
 
         defer {
@@ -572,12 +620,42 @@ final class AppController {
                 isVerifying = false
                 liveSimilarity = nil
 
+                // Authoritative pre-injection lock check. Two failure modes
+                // this closes off:
+                //
+                //   1. The user manually unlocked mid-scan (their screen is
+                //      now unlocked, arbitrary apps have focus). We must not
+                //      type the password into whatever window is frontmost.
+                //
+                //   2. A malicious user-session process spoofed the
+                //      `com.apple.screenIsLocked` notification to trick us
+                //      into thinking the screen is locked when it isn't. The
+                //      CGSession dictionary is authoritative and can't be
+                //      spoofed by unprivileged code.
+                //
+                // Cross-check both the cached notification-derived flag AND
+                // the live CGSession state. Refuse to inject if either
+                // reports "not locked".
+                guard lockMonitor.isScreenLocked,
+                      LockMonitor.isScreenActuallyLocked() else {
+                    status = .cancelled
+                    return
+                }
+
                 let delaySeconds = max(0, injectionDelaySeconds)
                 if delaySeconds > 0 {
                     status = .info(String(
                         format: "Verified. Typing password in %.1fs — focus the password field…", delaySeconds
                     ))
                     try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+                    // Re-check after the delay — the user might have unlocked
+                    // manually during it (or the injection-delay setting is
+                    // being abused to widen the attack window).
+                    guard lockMonitor.isScreenLocked,
+                          LockMonitor.isScreenActuallyLocked() else {
+                        status = .cancelled
+                        return
+                    }
                 }
 
                 // Read + inject + zero the plaintext, all inside one detached task.
@@ -607,7 +685,8 @@ final class AppController {
     // MARK: - Scan loop with movement-based liveness
 
     func scanForMatch(timeoutSeconds: Double) async throws -> ScanOutcome {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        let scanStart = Date()
+        let deadline = scanStart.addingTimeInterval(timeoutSeconds)
         var bestResult: VerificationResult? = nil           // best by centroid — for noMatch diagnostics
         var bestMatchResult: VerificationResult? = nil      // best frame that actually cleared the threshold
         var yawHistory: [Float] = []
@@ -618,7 +697,8 @@ final class AppController {
         let windowSize = 12
         let minSamples = 6
         let movementThreshold: Float = 0.013  // radians ≈ 0.75°
-        let embeddingWindowSize = 8           // best-of-N averaging window (larger = more noise cancellation, +0.01–0.02 similarity in room light)
+        let embeddingWindowSize = 15          // best-of-N averaging window — larger = more noise cancellation across cold-camera / variable-lighting jitter (√N scaling)
+        let warmupDiscardSeconds = scanWarmupDiscardMS / 1000.0
 
         while Date() < deadline {
             if Task.isCancelled { throw CancellationError() }
@@ -642,32 +722,54 @@ final class AppController {
                     rollHistory.removeFirst()
                 }
 
-                // Best-of-N: accumulate up to 8 recent embeddings and verify against the
-                // mean (re-normalized). Averaging smooths out single-frame noise from
-                // motion blur, exposure jitter, and alignment micro-errors — same-person
-                // similarity becomes more stable, so false rejections on a single fluke
-                // frame no longer happen.
-                embeddingWindow.append(analysis.embedding)
-                if embeddingWindow.count > embeddingWindowSize {
-                    embeddingWindow.removeFirst()
-                }
-                let liveEmbedding: [Float] = embeddingWindow.count >= 2
-                    ? Self.averageEmbeddings(embeddingWindow)
-                    : analysis.embedding
+                // Two filters on which frames feed the best-of-N verification path:
+                //
+                //   1. Warmup discard — frames captured in the first ~800ms of the
+                //      scan are face-detected + liveness-tracked but NOT used for
+                //      verification. Cold-camera AE/AWB is still converging then;
+                //      those embeddings don't match enrollment distribution.
+                //
+                //   2. Pose filter — off-angle frames (yaw or roll beyond the
+                //      pose envelope) are excluded from the embedding window. They
+                //      correspond to extreme-turn enrollment poses and shift the
+                //      running average away from typical head-on live views,
+                //      lowering centroid similarity.
+                //
+                // Both filters keep liveness ticking (yaw/roll history above), so
+                // total scan latency is unaffected — we just don't count noisy or
+                // off-pose frames when computing the match.
+                let elapsedInScan = Date().timeIntervalSince(scanStart)
+                let inWarmup = elapsedInScan < warmupDiscardSeconds
+                let poseAcceptable = abs(analysis.yaw) < poseAcceptableYawMax
+                                  && abs(analysis.roll) < poseAcceptableRollMax
 
-                let result = try service.verify(currentEmbedding: liveEmbedding,
-                                                threshold: matchThreshold)
-                liveSimilarity = LiveSimilarity(centroid: result.centroidSimilarity,
-                                                maxIndividual: result.maxIndividualSimilarity,
-                                                threshold: result.threshold)
+                if !inWarmup && poseAcceptable {
+                    // Best-of-N: accumulate up to N recent embeddings and verify against
+                    // the mean (re-normalized). Averaging smooths out single-frame noise
+                    // from motion blur, exposure jitter, and alignment micro-errors so
+                    // false rejections on a single fluke frame no longer happen.
+                    embeddingWindow.append(analysis.embedding)
+                    if embeddingWindow.count > embeddingWindowSize {
+                        embeddingWindow.removeFirst()
+                    }
+                    let liveEmbedding: [Float] = embeddingWindow.count >= 2
+                        ? Self.averageEmbeddings(embeddingWindow)
+                        : analysis.embedding
 
-                // Track best frame seen overall (for "best so far" reporting on timeout).
-                if bestResult == nil || result.centroidSimilarity > bestResult!.centroidSimilarity {
-                    bestResult = result
-                }
-                // Separately remember the best frame that actually cleared the threshold.
-                if result.matched, (bestMatchResult == nil || result.centroidSimilarity > bestMatchResult!.centroidSimilarity) {
-                    bestMatchResult = result
+                    let result = try service.verify(currentEmbedding: liveEmbedding,
+                                                    threshold: matchThreshold)
+                    liveSimilarity = LiveSimilarity(centroid: result.centroidSimilarity,
+                                                    maxIndividual: result.maxIndividualSimilarity,
+                                                    threshold: result.threshold)
+
+                    // Track best frame seen overall (for "best so far" reporting on timeout).
+                    if bestResult == nil || result.centroidSimilarity > bestResult!.centroidSimilarity {
+                        bestResult = result
+                    }
+                    // Separately remember the best frame that actually cleared the threshold.
+                    if result.matched, (bestMatchResult == nil || result.centroidSimilarity > bestMatchResult!.centroidSimilarity) {
+                        bestMatchResult = result
+                    }
                 }
 
                 let yawRange = yawHistory.count >= 2

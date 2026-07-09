@@ -10,7 +10,8 @@ A face-recognition unlock daemon for macOS. When you lock your Mac, FaceUnlock r
 
 ## What it does
 
-- Enrolls your face from 7 poses (straight, turn left/right, roll left/right, closer, farther) using **ArcFace** — the InsightFace ResNet50 model trained on WebFace600K, converted to Core ML and executed on the Apple Neural Engine.
+- Enrolls your face from 7 poses (straight, turn left/right, roll left/right, closer, farther) using **ArcFace** — the InsightFace ResNet50 model (buffalo_l / w600k_r50) converted to Core ML and executed on the Apple Neural Engine.
+- Enrollment captures each pose over a **2-second stability window** (multi-frame average → single high-quality embedding). Additive: you can run **"Add Captures"** later under different lighting to enlarge the enrolled set (up to 35 embeddings, oldest evicted FIFO).
 - On lock screen, when you press Space / Return or the display wakes from sleep, it silently scans your face, verifies identity + liveness, and types your Mac password into the password field.
 - Runs as a menu bar agent. Dock icon is optional and toggled at runtime.
 - Both the **Mac password** and the **enrolled face embeddings** are encrypted with AES-GCM using a session key that itself lives in the Keychain protected by Touch ID. First app launch after each reboot requires one Touch ID to unwrap the session key — same model as Face ID and Windows Hello.
@@ -43,12 +44,14 @@ flowchart TD
 
     U --> S[Camera on<br/>Start scan loop]
 
-    S --> V[Detect face inside ROI<br/>via Apple Vision]
-    V --> X{Exactly 1 face<br/>in ROI?}
+    S --> V[Detect face + landmarks inside ROI<br/>via Apple Vision]
+    V --> X{Exactly 1 face<br/>in ROI, pose within<br/>±20° yaw/roll?}
     X -->|no| S
-    X -->|yes| E[Crop face → ArcFace ANE inference<br/>512-d embedding]
+    X -->|yes| ALIGN[5-point Umeyama alignment<br/>→ 112×112 crop<br/>+ CLAHE + gamma normalize]
+    ALIGN --> E[ArcFace ANE inference<br/>512-d L2-normalized embedding<br/>+ TTA horizontal flip]
+    E --> AVG[Rolling best-of-N average<br/>15 frames]
 
-    E --> DEC[Decrypt enrolled embeddings<br/>with session key]
+    AVG --> DEC[Decrypt enrolled embeddings<br/>with session key]
     DEC --> M[Cosine similarity vs<br/>enrolled centroid + max]
     M --> Y{Both ≥ threshold?}
     Y -->|no| S
@@ -73,15 +76,22 @@ flowchart TD
 2. **Camera permission** → allow when prompted.
 3. **Accessibility permission**: Settings tab → "Request Permission…" → toggle FaceUnlock on in System Settings → Privacy & Security → Accessibility. Required to inject keystrokes into the lock screen.
 4. **Set Mac password**: Settings tab → "Set Password…" → enter your macOS login password twice. Generates a fresh AES-GCM 256-bit session key (or reuses the one from a prior enrollment), encrypts the password with it.
-5. **Enroll your face**: Face Recognition tab → "Capture" (requires Touch ID). Follow the 7-pose guide (straight, turn left/right, roll left/right, closer, farther). The resulting embeddings are encrypted with the same session key before being written to disk.
+5. **Enroll your face**: Face Recognition tab → "Capture" (requires Touch ID). Follow the 7-pose guide — each pose is captured over a **~2-second stability window** where multiple frames are averaged into a single high-quality embedding (√N noise reduction over a single-shot). The resulting embeddings are encrypted with the same session key before being written to disk.
 6. Turn on **"Auto-unlock when display wakes (while screen is locked)"** in Settings tab.
+
+### Improving accuracy over time
+
+Once you're enrolled, use **"Add Captures"** (the same button, relabeled once an enrollment exists) whenever you're in noticeably different lighting — morning window light vs afternoon overhead vs evening lamp, or with/without glasses. Each Add Captures session enrolls 7 more stable embeddings alongside the existing ones. This is the model that Face ID and Windows Hello use internally, and it's the reliable way to reach high thresholds (0.85+) across the full range of lighting you encounter daily.
+
+- Sessions 1–5: pure accumulation, growing 7 → 14 → 21 → 28 → 35.
+- Session 6+: at cap. Each new session evicts the oldest 7 embeddings (FIFO), so the enrolled set naturally tracks your current appearance / lighting over time.
 
 ### Optional
 
 - **Icon Placement** (menu bar → Icon Placement): toggle Dock and/or Menu Bar visibility independently.
 - **Launch at Login**: use macOS's built-in **System Settings → General → Login Items → Open at Login** to add FaceUnlock so it starts with your Mac.
 - **Auto-scan when face is centered**: polls the camera and triggers automatically when your face is well-positioned in the circle. Off by default.
-- **Match threshold**: default 0.70. Lower = easier match (faster, less strict). Higher = stricter. Persisted across launches.
+- **Match threshold**: default 0.70. Personal-use recommendations after enrollment: **0.75** balanced, **0.80** secure daily driver, **0.85** high-security (needs 2-3 Add Captures sessions across different lighting to be reliable). 0.90+ is not realistically achievable with a 2D camera. Persisted across launches.
 - **Auto-unlock delay**: default 4s between trigger and camera turning on. Gives you time to abort with `⌃⌘Q` → password if you decide against face unlock.
 
 ## Daily use
@@ -112,7 +122,10 @@ The session key is the single unwrap point. Without Touch ID, nothing decrypts:
 
 ### What's guaranteed
 
-- ✅ **Face match**: ArcFace 512-d embeddings. Cosine similarity against your enrolled centroid AND max, both must clear the threshold.
+- ✅ **Face match**: ArcFace ResNet50 (buffalo_l / w600k_r50), 512-d L2-normalized embeddings. Preprocessing matches InsightFace training-time exactly — **5-point Umeyama landmark alignment** (eyes + nose tip + mouth corners), 112×112 RGB crop normalized to [-1, 1], CLAHE + gamma exposure normalization for variable lighting, TTA horizontal flip. Verification requires cosine similarity against your enrolled centroid AND max-individual to clear the threshold.
+- ✅ **Multi-frame stability**: live scan runs a rolling **best-of-N average** (15 frames) with a pose filter (±20° yaw/roll) — averages out motion blur, exposure jitter, and alignment micro-errors before comparing to the enrolled set.
+- ✅ **Cold-camera handling**: verify waits for the camera to converge auto-exposure / auto-white-balance before scanning begins, then discards the first 800 ms of scan frames — prevents systematically over/underexposed frames from producing shifted embeddings after long display sleep.
+- ✅ **Enrollment quality**: each pose is captured over a 2-second stability window and multiple valid frames averaged into a single stored embedding.
 - ✅ **Liveness**: passive movement detection — natural yaw/roll variance of ≥ 0.013 rad over ~0.4s of data. A flat photograph or a screenshot can't accumulate the variance.
 - ✅ **ROI filtering**: only faces whose center falls inside the centered 50% × 60% ROI are considered — background people are ignored.
 - ✅ **AES-GCM encryption** of both password and enrollment data using a session key held only in memory after unwrap.
@@ -139,8 +152,9 @@ FaceUnlock is a **convenience layer over your macOS login password**. The passwo
 
 - **SwiftUI + `@Observable`** (macOS 14+)
 - **AVFoundation** — camera capture
-- **Vision** — face detection with normalized ROI filtering
+- **Vision** — face detection + `VNDetectFaceLandmarksRequest` for 5-point alignment
 - **Core ML** — ArcFace inference on the Apple Neural Engine
+- **Core Image / CGAffineTransform** — Umeyama least-squares 5-point similarity transform, CLAHE + gamma preprocessing
 - **CryptoKit** — AES-GCM 256-bit encryption of stored password AND enrolled embeddings
 - **LocalAuthentication** — Touch ID gating (enrollment, session unwrap, reset)
 - **Keychain Services** — session key (userPresence-gated) + encrypted password blob
@@ -178,8 +192,8 @@ If you'd prefer to migrate immediately: Face Recognition tab → Reset → Captu
 
 ## Acknowledgments
 
-- **InsightFace** for the [w600k_r50](https://github.com/deepinsight/insightface/tree/master/model_zoo) ArcFace model.
-- **FaceGate-Mac** by [@dweep-desai](https://github.com/dweep-desai/FaceGate-Mac) — this project's core ML pipeline structure (Vision face detection → 20% padded crop → 112×112 RGB normalized to [-1, 1] → Core ML embedding → centroid cosine similarity) is modeled after theirs.
+- **InsightFace** for the [w600k_r50](https://github.com/deepinsight/insightface/tree/master/model_zoo) ArcFace model. Alignment preprocessing follows the InsightFace 5-point canonical template documented in their [evaluation guide](https://insightface.ai).
+- **FaceGate-Mac** by [@dweep-desai](https://github.com/dweep-desai/FaceGate-Mac) — this project's initial ML pipeline structure (Vision face detection → padded crop → 112×112 → Core ML embedding → centroid cosine similarity) was modeled after theirs; the pipeline has since evolved to include 5-point Umeyama alignment, CLAHE + gamma normalization, best-of-N frame averaging, and additive multi-session enrollment.
 
 ## License
 
