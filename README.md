@@ -136,8 +136,7 @@ Older builds stored embeddings as plaintext JSON. This is auto-migrated to encry
 
 ## Acknowledgments
 
-- **InsightFace** for the [w600k_r50](https://github.com/deepinsight/insightface/tree/master/model_zoo) ArcFace model.
-- **FaceGate-Mac** by [@dweep-desai](https://github.com/dweep-desai/FaceGate-Mac) - this project's initial ML pipeline was modeled after theirs.
+- **InsightFace** for the [w600k_r50](https://github.com/deepinsight/insightface/tree/master/model_zoo)
 
 ## License
 
