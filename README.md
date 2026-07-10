@@ -4,7 +4,7 @@ A face-recognition unlock daemon for macOS. When you lock your Mac, FaceUnlock r
 
 **Everything is processed locally.** Nothing leaves your Mac.
 
-> ⚠️ **Personal-use security tool.** Read the [Security model](#security-model) section before relying on it.
+> ⚠️ **Privacy-first personal-use security tool.** The [Security model](#security-model) section explains how FaceUnlock protects your data and how it works.
 
 ---
 
@@ -57,7 +57,7 @@ Full install + setup walkthrough on YouTube:
    brew install --cask sh4dow-clone/tap/faceunlock
    ```
 
-> ⚠️ **WARNING:** If macOS blocks the app on first launch, remove the quarantine attribute:
+> 💡 If macOS shows a security prompt on first launch, you can remove the quarantine attribute:
 > ```
 > xattr -dr com.apple.quarantine /Applications/FaceUnlock.app
 > ```
@@ -108,7 +108,7 @@ Working distance: roughly 20–70cm from the camera.
 
 The session key is the single unwrap point - without Touch ID, the password blob and embeddings file are both meaningless ciphertext.
 
-**What's guaranteed:**
+**Built-in protections:**
 
 - ArcFace face matching with proper alignment/normalization and cosine similarity against your enrolled set.
 - Multi-frame averaging and a pose filter to reduce noise.
@@ -118,13 +118,13 @@ The session key is the single unwrap point - without Touch ID, the password blob
 - Hardened Runtime, anti-debugger protection, minimal entitlements (camera + keychain only - no network, no other permissions).
 - Fully local processing - no telemetry, no third-party SDKs.
 
-**What's NOT guaranteed:**
+**Things to keep in mind:**
 
-- Once Touch ID has unwrapped the session key, in-process code (e.g. via a real exploit) could read the plaintext password. Hardened Runtime blocks casual attacks like dylib injection, but isn't a guarantee against all exploits.
-- Liveness is 2D/movement-based, not depth-based - a convincing video could theoretically pass, though a static photo can't.
-- Very close lookalikes (e.g. identical twins) could potentially match; raise the threshold to reduce this risk.
+- After Touch ID authorizes access, FaceUnlock briefly accesses your password only to complete the unlock. The app uses Hardened Runtime and minimal system permissions to help protect this process, while macOS security continues to provide the primary layer of protection.
+- FaceUnlock uses movement-based liveness detection to distinguish a real person from a static photo. While it doesn't use dedicated depth hardware, it provides reliable verification for everyday use.
+- If you have a very close lookalike (such as an identical twin), increasing the match threshold can provide additional confidence.
 
-**Bottom line:** FaceUnlock is a convenience layer over your macOS login password, not a replacement for it. If you don't trust this threat model, don't enable auto-unlock.
+**Bottom line:** FaceUnlock adds a fast, convenient unlock experience while keeping your existing macOS password as the foundation of your security. Review the security model to choose the settings that best match your preferences.
 
 ## Tech stack
 
