@@ -1,4 +1,4 @@
-# FaceUnlock
+# macOS FaceUnlock
 
 A face-recognition unlock daemon for macOS. When you lock your Mac, FaceUnlock recognizes you through the camera and types your password into the lock screen for you. No additional hardware required - the FaceTime camera and Apple Neural Engine do the work.
 
