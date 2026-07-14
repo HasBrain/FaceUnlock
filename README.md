@@ -42,7 +42,7 @@ A face-recognition unlock daemon for macOS. When you lock your Mac, FaceUnlock r
 
 Full install + setup walkthrough on YouTube:
 
-[![FaceUnlock walkthrough](https://img.youtube.com/vi/sesaudxvPDY/0.jpg)](https://youtu.be/sesaudxvPDY)
+[![FaceUnlock walkthrough](https://img.youtube.com/vi/hPLT-sykfNc/maxresdefault.jpg)](https://youtu.be/hPLT-sykfNc)
 
 ## Install
 
