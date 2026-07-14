@@ -72,6 +72,10 @@ Full install + setup walkthrough on YouTube:
 > 💡 If macOS shows a security prompt on first launch, you can remove the quarantine attribute:
 > ```
 > xattr -dr com.apple.quarantine /Applications/FaceUnlock.app
+>
+> codesign --force --deep --sign - /Applications/FaceUnlock.app
+>
+> The first removes the quarantine flag, the second adds a local signature (required on macOS 26+).
 > ```
 
 ### Direct download
