@@ -153,3 +153,15 @@ Older builds stored embeddings as plaintext JSON. This is auto-migrated to encry
 ## License
 
 Personal-use. If you redistribute, verify InsightFace's model license terms apply to your use case.
+
+## Support
+
+If it's saved you some time, consider supporting - I'm a student maintaining this in my spare time.
+
+Right now I'm trying to raise **$99 for an Apple Developer Program membership**. That's what it costs to get the app properly signed and notarized - which would eliminate the security warning on install entirely. No more scary popups, no more running `xattr` in the terminal just to open the app.
+
+If you've hit that warning yourself, that's exactly what your support would fix for everyone after you.
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/sh4dow_clone)
+
+A ⭐ star also helps - it makes the project easier to find for other macOS users who need this.
