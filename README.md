@@ -1,10 +1,22 @@
-# macOS FaceUnlock
+<div align="center">
+<img src="FaceUnlock/Assets.xcassets/AppIcon.appiconset/512.png" width="96" alt="FaceUnlock icon" /><br><br>
+ 
+<h1>macOS FaceUnlock</h1>
+ 
+<p><strong>Unlock your Mac with your face.</strong><br>
+Free, open-source face-recognition unlock daemon for macOS. No additional hardware, no cloud, no subscription.</p>
+ 
+ 
+![Download](https://img.shields.io/badge/Download-v1.0.0-555?style=flat-square&labelColor=555555&color=0075ca)
+![macOS](https://img.shields.io/badge/macOS-13.0%2B-555?style=flat-square&labelColor=555555&color=0075ca)
+![Camera](https://img.shields.io/badge/camera-FaceTime-555?style=flat-square&labelColor=555555&color=2ea44f)
+![Processing](https://img.shields.io/badge/processing-local%20only-555?style=flat-square&labelColor=555555&color=2ea44f)
+![Telemetry](https://img.shields.io/badge/telemetry-none-555?style=flat-square&labelColor=555555&color=2ea44f)
+![License](https://img.shields.io/badge/license-MIT-555?style=flat-square&labelColor=555555&color=2ea44f)
+![Stars](https://img.shields.io/github/stars/HasBrain/FaceUnlock?style=flat-square&labelColor=555555&color=0075ca)
 
-A face-recognition unlock daemon for macOS. When you lock your Mac, FaceUnlock recognizes you through the camera and types your password into the lock screen for you. No additional hardware required - the FaceTime camera and Apple Neural Engine do the work.
-
-**Everything is processed locally.** Nothing leaves your Mac.
-
-> ⚠️ **Privacy-first personal-use security tool.** The [Security model](#security-model) section explains how FaceUnlock protects your data and how it works.
+  
+</div>
 
 ---
 
