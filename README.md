@@ -69,10 +69,24 @@ Full install + setup walkthrough on YouTube:
    brew install --cask sh4dow-clone/tap/faceunlock
    ```
 
-> 💡 If macOS shows a security prompt on first launch, you can remove the quarantine attribute:
+> 💡 **If macOS blocks the app on first launch (especially on macOS 26+), re-sign it with a local ad-hoc signature and remove the quarantine attribute:**
+>
+> ```bash
+> codesign -d --entitlements - /Applications/FaceUnlock.app > /tmp/fu.plist
+> ```
+>
+> ```bash
+> codesign --force --deep --sign - --entitlements /tmp/fu.plist /Applications/FaceUnlock.app
+> ```
+>
+> You can verify the signature with:
+>
+> ```bash
+> codesign --verify --deep --strict --verbose=2 /Applications/FaceUnlock.app
+> ```
+>
 > ```
 > xattr -dr com.apple.quarantine /Applications/FaceUnlock.app
->
 > ```
 
 
@@ -161,7 +175,7 @@ Personal-use. If you redistribute, verify InsightFace's model license terms appl
 
 If it's saved you some time, consider supporting - I'm a student maintaining this in my spare time.
 
-Right now I'm trying to raise **$99 for an Apple Developer Program membership**. That's what it costs to get the app properly signed and notarized - which would eliminate the security warning on install entirely. No more scary popups, no more running `xattr` in the terminal just to open the app.
+Right now I'm trying to raise **$99 for an Apple Developer Program membership**. That's what it costs to get the app properly signed and notarized - which would eliminate the security warning on install entirely. No more scary popups, no more running `xattr` and `codesign` in the terminal just to open the app.
 
 If you've hit that warning yourself, that's exactly what your support would fix for everyone after you.
 
