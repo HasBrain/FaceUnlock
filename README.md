@@ -75,10 +75,7 @@ Full install + setup walkthrough on YouTube:
 >
 > ```
 
-> The first removes the quarantine flag, the second adds a local signature (required on macOS 26+).
-> ```
-> codesign --force --deep --sign - /Applications/FaceUnlock.app
-> ```
+
 
 ### Direct download
 
