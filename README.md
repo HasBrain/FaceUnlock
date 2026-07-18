@@ -7,8 +7,8 @@
 Free, open-source face-recognition unlock daemon for macOS. No additional hardware, no cloud, no subscription.</p>
  
  
-![Download](https://img.shields.io/badge/Download-v1.0.0-555?style=flat-square&labelColor=555555&color=0075ca)
-![macOS](https://img.shields.io/badge/macOS-13.0%2B-555?style=flat-square&labelColor=555555&color=0075ca)
+![Download](https://img.shields.io/badge/Download-v1.1.0-555?style=flat-square&labelColor=555555&color=0075ca)
+![macOS](https://img.shields.io/badge/macOS-14.0%2B-555?style=flat-square&labelColor=555555&color=0075ca)
 ![Camera](https://img.shields.io/badge/camera-FaceTime-555?style=flat-square&labelColor=555555&color=2ea44f)
 ![Processing](https://img.shields.io/badge/processing-local%20only-555?style=flat-square&labelColor=555555&color=2ea44f)
 ![Telemetry](https://img.shields.io/badge/telemetry-none-555?style=flat-square&labelColor=555555&color=2ea44f)
@@ -117,7 +117,7 @@ Working distance: roughly 20–70cm from the camera.
 | Data | Storage | Encryption |
 |---|---|---|
 | Mac password | Keychain | AES-GCM + Keychain |
-| Session key | Keychain | `SecAccessControl(.userPresence)` - Touch ID required |
+| Session key | Keychain | AES-GCM + Touch ID (enforced by app via LocalAuthentication) |
 | Face embeddings | `~/Library/Application Support/FaceUnlock/embeddings.enc` | AES-GCM, same session key |
 | Settings | UserDefaults | Plaintext (not sensitive) |
 
@@ -130,7 +130,7 @@ The session key is the single unwrap point - without Touch ID, the password blob
 - Passive movement-based liveness check (defeats static photos).
 - Only faces in a centered ROI are considered.
 - Password exists as plaintext only briefly, zeroed immediately after use.
-- Hardened Runtime, anti-debugger protection, minimal entitlements (camera + keychain only - no network, no other permissions).
+- Hardened Runtime, anti-debugger protection, minimal entitlements (camera - no network, no other permissions).
 - Fully local processing - no telemetry, no third-party SDKs.
 
 **Things to keep in mind:**
@@ -161,7 +161,7 @@ Personal-use. If you redistribute, verify InsightFace's model license terms appl
 
 If it's saved you some time, consider supporting - I'm a student maintaining this in my spare time.
 
-Right now I'm trying to raise **$99 for an Apple Developer Program membership**. That's what it costs to get the app properly signed and notarized - which would eliminate the security warning on install entirely. No more scary popups, no more running `xattr` and `codesign` in the terminal just to open the app.
+Right now I'm trying to raise **$99 for an Apple Developer Program membership**. That's what it costs to get the app properly signed and notarized - which would eliminate the security warning on install entirely. No more scary popups, no more running `xattr` in the terminal just to open the app.
 
 If you've hit that warning yourself, that's exactly what your support would fix for everyone after you.
 
