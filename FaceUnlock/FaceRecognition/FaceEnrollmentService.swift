@@ -65,8 +65,8 @@ enum FacePose: CaseIterable {
     var prompt: String {
         switch self {
         case .straight:  return "Look straight at the camera"
-        case .turnLeft:  return "Turn your head to the LEFT"
-        case .turnRight: return "Turn your head to the RIGHT"
+        case .turnLeft:  return "Turn your head to the RIGHT"
+        case .turnRight: return "Turn your head to the LEFT"
         case .rollLeft:  return "Tilt head - LEFT ear toward shoulder"
         case .rollRight: return "Tilt head - RIGHT ear toward shoulder"
         case .closer:    return "Move CLOSER to the camera"

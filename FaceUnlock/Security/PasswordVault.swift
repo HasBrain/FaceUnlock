@@ -3,8 +3,12 @@
 //  FaceUnlock
 //
 //  Two-tier password storage:
-//    1. Session key (256-bit AES) — Keychain-stored, gated by Touch ID (.userPresence).
-//       Held in memory as a `SymmetricKey` after one successful unwrap per app launch.
+//    1. Session key (256-bit AES) — Keychain-stored (kSecAttrAccessibleWhenUnlockedThisDeviceOnly).
+//       Touch ID is enforced by the app via LAContext.evaluatePolicy in
+//       unlockSession(reason:), NOT by Keychain-level SecAccessControl. The
+//       `.userPresence` access control was removed for ad-hoc signing
+//       compatibility (see Changes_i_did.txt). Held in memory as a
+//       `SymmetricKey` after one successful unwrap per app launch.
 //    2. Encrypted password blob (AES-GCM) — Keychain-stored, no biometric gate.
 //       Meaningless without the session key.
 //
@@ -205,15 +209,34 @@ enum PasswordVault {
     /// Blocking; call from a background actor.
     nonisolated static func unlockSession(reason: String) throws {
         let context = LAContext()
-        context.localizedReason = reason
+        var authError: NSError?
 
+        // Explicitly prompt Touch ID — required because the Keychain item no
+        // longer has .userPresence access control (removed for ad-hoc signing
+        // compatibility), so kSecUseAuthenticationContext is ignored by SecItem.
+        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &authError) else {
+            throw PasswordVaultError.userCancelled
+        }
+
+        var authResult = false
+        let sema = DispatchSemaphore(value: 0)
+        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, _ in
+            authResult = success
+            sema.signal()
+        }
+        sema.wait()
+
+        guard authResult else {
+            throw PasswordVaultError.userCancelled
+        }
+
+        // Touch ID passed — now read the key silently (no auth gate on the item)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: sessionKeyAccount,
             kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecUseAuthenticationContext as String: context
+            kSecMatchLimit as String: kSecMatchLimitOne
         ]
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
@@ -222,8 +245,7 @@ enum PasswordVault {
             guard let data = item as? Data else {
                 throw PasswordVaultError.dataEncodingFailed
             }
-            let key = SymmetricKey(data: data)
-            storeCachedKey(key)
+            storeCachedKey(SymmetricKey(data: data))
         case errSecUserCanceled, errSecAuthFailed:
             throw PasswordVaultError.userCancelled
         default:
@@ -290,25 +312,12 @@ enum PasswordVault {
     // MARK: - Internal Keychain helpers
 
     nonisolated private static func saveSessionKey(_ key: SymmetricKey) throws {
-        // Wipe any prior key first (may itself be Touch-ID-gated; delete allowed regardless).
         let deleteQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: sessionKeyAccount
         ]
         SecItemDelete(deleteQuery as CFDictionary)
-
-        // Touch ID / device password gate on read.
-        var accessError: Unmanaged<CFError>?
-        guard let access = SecAccessControlCreateWithFlags(
-            kCFAllocatorDefault,
-            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-            .userPresence,
-            &accessError
-        ) else {
-            let msg = (accessError?.takeRetainedValue() as Error?)?.localizedDescription ?? "unknown"
-            throw PasswordVaultError.accessControlFailed(msg)
-        }
 
         let keyData = key.withUnsafeBytes { Data($0) }
 
@@ -317,14 +326,14 @@ enum PasswordVault {
             kSecAttrService as String: service,
             kSecAttrAccount as String: sessionKeyAccount,
             kSecValueData as String: keyData,
-            kSecAttrAccessControl as String: access
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly  // no .userPresence
         ]
         let status = SecItemAdd(addQuery as CFDictionary, nil)
         guard status == errSecSuccess else {
             throw PasswordVaultError.keychainError(status)
         }
     }
-
+    
     nonisolated private static func saveEncryptedBlob(_ data: Data) throws {
         let deleteQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
