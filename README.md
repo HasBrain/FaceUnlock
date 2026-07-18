@@ -69,21 +69,7 @@ Full install + setup walkthrough on YouTube:
    brew install --cask sh4dow-clone/tap/faceunlock
    ```
 
-> 💡 **If macOS blocks the app on first launch (especially on macOS 26+), re-sign it with a local ad-hoc signature and remove the quarantine attribute:**
->
-> ```bash
-> codesign -d --entitlements - /Applications/FaceUnlock.app > /tmp/fu.plist
-> ```
->
-> ```bash
-> codesign --force --deep --sign - --entitlements /tmp/fu.plist /Applications/FaceUnlock.app
-> ```
->
-> You can verify the signature with:
->
-> ```bash
-> codesign --verify --deep --strict --verbose=2 /Applications/FaceUnlock.app
-> ```
+> 💡 **If macOS blocks the app on first launch remove the quarantine attribute:**
 >
 > ```
 > xattr -dr com.apple.quarantine /Applications/FaceUnlock.app
