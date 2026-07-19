@@ -146,8 +146,9 @@ Older builds stored embeddings as plaintext JSON. This is auto-migrated to encry
 - **InsightFace** for the [w600k_r50](https://github.com/deepinsight/insightface/tree/master/model_zoo)
 
 ## License
+**App code:** [MIT License](https://github.com/HasBrain/FaceUnlock/blob/main/LICENSE)
 
-Personal-use. If you redistribute, verify InsightFace's model license terms apply to your use case.
+**Face recognition model:** ArcFace `w600k_r50` (InsightFace), used under InsightFace's non-commercial research license. This app is free and non-commercial. See [InsightFace license terms](https://github.com/deepinsight/insightface#license) for details.
 
 ## Support
 
