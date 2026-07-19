@@ -50,7 +50,7 @@
 
 Full install + setup walkthrough on YouTube:
 
-[![FaceUnlock walkthrough](https://img.youtube.com/vi/hPLT-sykfNc/maxresdefault.jpg)](https://youtu.be/TZHXuBUaZ_8)
+[![FaceUnlock walkthrough](https://img.youtube.com/vi/TZHXuBUaZ_8/maxresdefault.jpg)](https://youtu.be/TZHXuBUaZ_8)
 
 ## Install
 
